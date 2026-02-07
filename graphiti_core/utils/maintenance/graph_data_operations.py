@@ -96,6 +96,59 @@ async def retrieve_episodes(
         except NotImplementedError:
             pass
 
+    if driver.provider == GraphProvider.SURREALDB:
+        query_params: dict = {}
+        query_filter = ''
+        if saga is not None:
+            group_id = group_ids[0] if group_ids else None
+            source_filter = 'AND source = $source' if source is not None else ''
+            records, _, _ = await driver.execute_query(
+                f"""
+                SELECT content, created_at, valid_at, uuid, name, group_id,
+                    source_description, source, entity_edges
+                FROM episodic
+                WHERE uuid IN (
+                    SELECT VALUE out.uuid FROM has_episode
+                    WHERE in.name = $saga_name AND in.group_id = $group_id
+                )
+                AND valid_at <= $reference_time
+                {source_filter}
+                ORDER BY valid_at DESC
+                LIMIT $num_episodes
+                """,
+                saga_name=saga,
+                group_id=group_id,
+                reference_time=reference_time,
+                source=source.name if source else None,
+                num_episodes=last_n,
+            )
+            episodes = [get_episodic_node_from_record(record) for record in records]
+            return list(reversed(episodes))
+
+        if group_ids and len(group_ids) > 0:
+            query_filter += '\nAND group_id IN $group_ids'
+            query_params['group_ids'] = group_ids
+        if source is not None:
+            query_filter += '\nAND source = $source'
+            query_params['source'] = source.name
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT content, created_at, valid_at, uuid, name, group_id,
+                source_description, source, entity_edges
+            FROM episodic
+            WHERE valid_at <= $reference_time
+            {query_filter}
+            ORDER BY valid_at DESC
+            LIMIT $num_episodes
+            """,
+            reference_time=reference_time,
+            num_episodes=last_n,
+            **query_params,
+        )
+        episodes = [get_episodic_node_from_record(record) for record in records]
+        return list(reversed(episodes))
+
     # If saga is provided, retrieve episodes from that saga only
     if saga is not None:
         group_id = group_ids[0] if group_ids else None
@@ -127,15 +180,15 @@ async def retrieve_episodes(
         episodes = [get_episodic_node_from_record(record) for record in records]
         return list(reversed(episodes))  # Return in chronological order
 
-    query_params: dict = {}
+    query_params_cypher: dict = {}
     query_filter = ''
     if group_ids and len(group_ids) > 0:
         query_filter += '\nAND e.group_id IN $group_ids'
-        query_params['group_ids'] = group_ids
+        query_params_cypher['group_ids'] = group_ids
 
     if source is not None:
         query_filter += '\nAND e.source = $source'
-        query_params['source'] = source.name
+        query_params_cypher['source'] = source.name
 
     query: LiteralString = (
         """
@@ -160,7 +213,7 @@ async def retrieve_episodes(
         query,
         reference_time=reference_time,
         num_episodes=last_n,
-        **query_params,
+        **query_params_cypher,
     )
 
     episodes = [get_episodic_node_from_record(record) for record in result]

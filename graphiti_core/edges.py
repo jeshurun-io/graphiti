@@ -63,7 +63,13 @@ class Edge(BaseModel, ABC):
             except NotImplementedError:
                 pass
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider == GraphProvider.SURREALDB:
+            for table in ['relates_to', 'mentions', 'has_member']:
+                await driver.execute_query(
+                    f'DELETE FROM {table} WHERE uuid = $uuid;',
+                    uuid=self.uuid,
+                )
+        elif driver.provider == GraphProvider.KUZU:
             await driver.execute_query(
                 """
                 MATCH (n)-[e:MENTIONS|HAS_MEMBER {uuid: $uuid}]->(m)
@@ -99,7 +105,13 @@ class Edge(BaseModel, ABC):
             except NotImplementedError:
                 pass
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider == GraphProvider.SURREALDB:
+            for table in ['relates_to', 'mentions', 'has_member']:
+                await driver.execute_query(
+                    f'DELETE FROM {table} WHERE uuid IN $uuids;',
+                    uuids=uuids,
+                )
+        elif driver.provider == GraphProvider.KUZU:
             await driver.execute_query(
                 """
                 MATCH (n)-[e:MENTIONS|HAS_MEMBER]->(m)
@@ -299,20 +311,23 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        query = """
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
-            RETURN e.fact_embedding AS fact_embedding
-        """
-
-        if driver.provider == GraphProvider.NEPTUNE:
+        if driver.provider == GraphProvider.SURREALDB:
+            query = """
+                SELECT fact_embedding FROM relates_to WHERE uuid = $uuid
+            """
+        elif driver.provider == GraphProvider.NEPTUNE:
             query = """
                 MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
                 RETURN [x IN split(e.fact_embedding, ",") | toFloat(x)] as fact_embedding
             """
-
-        if driver.provider == GraphProvider.KUZU:
+        elif driver.provider == GraphProvider.KUZU:
             query = """
                 MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: $uuid})-[:RELATES_TO]->(m:Entity)
+                RETURN e.fact_embedding AS fact_embedding
+            """
+        else:
+            query = """
+                MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
                 RETURN e.fact_embedding AS fact_embedding
             """
 
@@ -374,23 +389,35 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        match_query = """
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
-        """
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider == GraphProvider.SURREALDB:
+            records, _, _ = await driver.execute_query(
+                """
+                SELECT uuid, group_id, in.uuid AS source_node_uuid,
+                    out.uuid AS target_node_uuid, created_at, name, fact,
+                    episodes, expired_at, valid_at, invalid_at, {} AS attributes
+                FROM relates_to WHERE uuid = $uuid
+                """,
+                uuid=uuid,
+                routing_='r',
+            )
+        else:
             match_query = """
-                MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: $uuid})-[:RELATES_TO]->(m:Entity)
+                MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
             """
+            if driver.provider == GraphProvider.KUZU:
+                match_query = """
+                    MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: $uuid})-[:RELATES_TO]->(m:Entity)
+                """
 
-        records, _, _ = await driver.execute_query(
-            match_query
-            + """
-            RETURN
-            """
-            + get_entity_edge_return_query(driver.provider),
-            uuid=uuid,
-            routing_='r',
-        )
+            records, _, _ = await driver.execute_query(
+                match_query
+                + """
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider),
+                uuid=uuid,
+                routing_='r',
+            )
 
         edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
 
@@ -410,26 +437,40 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        match_query = """
-            MATCH (n:Entity {uuid: $source_node_uuid})-[e:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
-        """
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider == GraphProvider.SURREALDB:
+            records, _, _ = await driver.execute_query(
+                """
+                SELECT uuid, group_id, in.uuid AS source_node_uuid,
+                    out.uuid AS target_node_uuid, created_at, name, fact,
+                    episodes, expired_at, valid_at, invalid_at, {} AS attributes
+                FROM relates_to
+                WHERE in.uuid = $source_node_uuid AND out.uuid = $target_node_uuid
+                """,
+                source_node_uuid=source_node_uuid,
+                target_node_uuid=target_node_uuid,
+                routing_='r',
+            )
+        else:
             match_query = """
-                MATCH (n:Entity {uuid: $source_node_uuid})
-                      -[:RELATES_TO]->(e:RelatesToNode_)
-                      -[:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
+                MATCH (n:Entity {uuid: $source_node_uuid})-[e:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
             """
+            if driver.provider == GraphProvider.KUZU:
+                match_query = """
+                    MATCH (n:Entity {uuid: $source_node_uuid})
+                          -[:RELATES_TO]->(e:RelatesToNode_)
+                          -[:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
+                """
 
-        records, _, _ = await driver.execute_query(
-            match_query
-            + """
-            RETURN
-            """
-            + get_entity_edge_return_query(driver.provider),
-            source_node_uuid=source_node_uuid,
-            target_node_uuid=target_node_uuid,
-            routing_='r',
-        )
+            records, _, _ = await driver.execute_query(
+                match_query
+                + """
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider),
+                source_node_uuid=source_node_uuid,
+                target_node_uuid=target_node_uuid,
+                routing_='r',
+            )
 
         edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
 
@@ -959,7 +1000,10 @@ def get_episodic_edge_from_record(record: Any) -> EpisodicEdge:
 
 def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityEdge:
     episodes = record['episodes']
-    if provider == GraphProvider.KUZU:
+    if provider == GraphProvider.SURREALDB:
+        # SurrealDB returns only queried fields, no attributes dict
+        attributes = {}
+    elif provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
     else:
         attributes = record['attributes']

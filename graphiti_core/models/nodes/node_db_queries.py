@@ -21,6 +21,21 @@ from graphiti_core.driver.driver import GraphProvider
 
 def get_episode_node_save_query(provider: GraphProvider) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                UPSERT type::thing('episodic', $uuid) CONTENT {
+                    uuid: $uuid,
+                    name: $name,
+                    group_id: $group_id,
+                    labels: [],
+                    source: $source,
+                    source_description: $source_description,
+                    content: $content,
+                    entity_edges: $entity_edges,
+                    created_at: $created_at,
+                    valid_at: $valid_at
+                } RETURN uuid;
+            """
         case GraphProvider.NEPTUNE:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
@@ -60,6 +75,20 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
 
 def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            # SurrealDB uses INSERT ... ON DUPLICATE KEY UPDATE for bulk upserts
+            return """
+                INSERT INTO episodic $episodes ON DUPLICATE KEY UPDATE
+                    name = $input.name,
+                    group_id = $input.group_id,
+                    source = $input.source,
+                    source_description = $input.source_description,
+                    content = $input.content,
+                    entity_edges = $input.entity_edges,
+                    created_at = $input.created_at,
+                    valid_at = $input.valid_at
+                RETURN uuid;
+            """
         case GraphProvider.NEPTUNE:
             return """
                 UNWIND $episodes AS episode
@@ -128,6 +157,18 @@ EPISODIC_NODE_RETURN_NEPTUNE = """
 
 def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: bool = False) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                UPSERT type::thing('entity', $entity_data.uuid) CONTENT {
+                    uuid: $entity_data.uuid,
+                    name: $entity_data.name,
+                    group_id: $entity_data.group_id,
+                    labels: $entity_data.labels,
+                    summary: $entity_data.summary,
+                    created_at: $entity_data.created_at,
+                    name_embedding: $entity_data.name_embedding
+                } RETURN uuid;
+            """
         case GraphProvider.FALKORDB:
             return f"""
                 MERGE (n:Entity {{uuid: $entity_data.uuid}})
@@ -184,6 +225,17 @@ def get_entity_node_save_bulk_query(
     provider: GraphProvider, nodes: list[dict], has_aoss: bool = False
 ) -> str | Any:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                INSERT INTO entity $nodes ON DUPLICATE KEY UPDATE
+                    name = $input.name,
+                    group_id = $input.group_id,
+                    labels = $input.labels,
+                    summary = $input.summary,
+                    created_at = $input.created_at,
+                    name_embedding = $input.name_embedding
+                RETURN uuid;
+            """
         case GraphProvider.FALKORDB:
             queries = []
             for node in nodes:
@@ -255,6 +307,16 @@ def get_entity_node_save_bulk_query(
 
 def get_entity_node_return_query(provider: GraphProvider) -> str:
     # `name_embedding` is not returned by default and must be loaded manually using `load_name_embedding()`.
+    if provider == GraphProvider.SURREALDB:
+        return """
+            n.uuid AS uuid,
+            n.name AS name,
+            n.group_id AS group_id,
+            n.labels AS labels,
+            n.created_at AS created_at,
+            n.summary AS summary
+        """
+
     if provider == GraphProvider.KUZU:
         return """
             n.uuid AS uuid,
@@ -279,6 +341,18 @@ def get_entity_node_return_query(provider: GraphProvider) -> str:
 
 def get_community_node_save_query(provider: GraphProvider) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                UPSERT type::thing('community', $uuid) CONTENT {
+                    uuid: $uuid,
+                    name: $name,
+                    group_id: $group_id,
+                    labels: [],
+                    summary: $summary,
+                    created_at: $created_at,
+                    name_embedding: $name_embedding
+                } RETURN uuid;
+            """
         case GraphProvider.FALKORDB:
             return """
                 MERGE (n:Community {uuid: $uuid})
@@ -333,6 +407,16 @@ COMMUNITY_NODE_RETURN_NEPTUNE = """
 
 def get_saga_node_save_query(provider: GraphProvider) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                UPSERT type::thing('saga', $uuid) CONTENT {
+                    uuid: $uuid,
+                    name: $name,
+                    group_id: $group_id,
+                    labels: [],
+                    created_at: $created_at
+                } RETURN uuid;
+            """
         case GraphProvider.KUZU:
             return """
                 MERGE (n:Saga {uuid: $uuid})

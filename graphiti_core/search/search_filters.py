@@ -84,7 +84,10 @@ def node_search_filter_query_constructor(
     filter_params: dict[str, Any] = {}
 
     if filters.node_labels is not None:
-        if provider == GraphProvider.KUZU:
+        if provider == GraphProvider.SURREALDB:
+            node_label_filter = 'labels CONTAINSALL $labels'
+            filter_params['labels'] = filters.node_labels
+        elif provider == GraphProvider.KUZU:
             node_label_filter = 'list_has_all(n.labels, $labels)'
             filter_params['labels'] = filters.node_labels
         else:
@@ -125,7 +128,10 @@ def edge_search_filter_query_constructor(
         filter_params['edge_uuids'] = filters.edge_uuids
 
     if filters.node_labels is not None:
-        if provider == GraphProvider.KUZU:
+        if provider == GraphProvider.SURREALDB:
+            node_label_filter = 'in.labels CONTAINSALL $labels AND out.labels CONTAINSALL $labels'
+            filter_params['labels'] = filters.node_labels
+        elif provider == GraphProvider.KUZU:
             node_label_filter = (
                 'list_has_all(n.labels, $labels) AND list_has_all(m.labels, $labels)'
             )

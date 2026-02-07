@@ -221,6 +221,47 @@ async def add_nodes_and_edges_bulk_tx(
         )
         await driver.graph_operations_interface.edge_save_bulk(None, driver, tx, edges)
 
+    elif driver.provider == GraphProvider.SURREALDB:
+        # SurrealDB INSERT RELATION needs record link types for in/out.
+        # Use single-row queries with type::thing() for correct record link construction.
+        from graphiti_core.models.edges.edge_db_queries import get_entity_edge_save_query
+        from graphiti_core.models.nodes.node_db_queries import (
+            get_entity_node_save_query,
+            get_episode_node_save_query,
+        )
+
+        episode_query = get_episode_node_save_query(driver.provider)
+        for episode in episodes:
+            await tx.run(episode_query, **episode)
+
+        entity_node_query = get_entity_node_save_query(driver.provider, labels='', has_aoss=False)
+        for node in nodes:
+            await tx.run(entity_node_query, entity_data=node)
+
+        entity_edge_query = get_entity_edge_save_query(driver.provider)
+        for edge_data in edges:
+            edge_data['source_uuid'] = edge_data.pop('source_node_uuid', '')
+            edge_data['target_uuid'] = edge_data.pop('target_node_uuid', '')
+            await tx.run(entity_edge_query, edge_data=edge_data)
+
+        for edge in episodic_edges:
+            d = edge.model_dump()
+            await tx.run(
+                """
+                INSERT RELATION INTO mentions {
+                    id: type::thing('mentions', $uuid),
+                    in: type::thing('episodic', $source_node_uuid),
+                    out: type::thing('entity', $target_node_uuid),
+                    uuid: $uuid,
+                    group_id: $group_id,
+                    created_at: $created_at
+                } ON DUPLICATE KEY UPDATE
+                    group_id = $input.group_id,
+                    created_at = $input.created_at
+                RETURN uuid;
+                """,
+                **d,
+            )
     elif driver.provider == GraphProvider.KUZU:
         # FIXME: Kuzu's UNWIND does not currently support STRUCT[] type properly, so we insert the data one by one instead for now.
         episode_query = get_episode_node_save_bulk_query(driver.provider)

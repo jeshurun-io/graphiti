@@ -37,6 +37,7 @@ from graphiti_core.helpers import (
     lucene_sanitize,
     normalize_l2,
     semaphore_gather,
+    surrealdb_sanitize,
 )
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.models.nodes.node_db_queries import (
@@ -82,6 +83,13 @@ def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> f
 
 
 def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver):
+    if driver.provider == GraphProvider.SURREALDB:
+        # SurrealDB uses @@ operator directly in WHERE clauses.
+        # Group filtering is done separately via AND group_id IN $group_ids.
+        sanitized = surrealdb_sanitize(query)
+        if len(sanitized.split(' ')) > MAX_QUERY_LENGTH:
+            return ''
+        return sanitized
     if driver.provider == GraphProvider.KUZU:
         # Kuzu only supports simple queries.
         if len(query.split(' ')) > MAX_QUERY_LENGTH:
@@ -136,6 +144,18 @@ async def get_mentioned_nodes(
 
     episode_uuids = [episode.uuid for episode in episodes]
 
+    if driver.provider == GraphProvider.SURREALDB:
+        records, _, _ = await driver.execute_query(
+            """
+            SELECT uuid, name, group_id, labels, created_at, summary
+            FROM entity
+            WHERE uuid IN (SELECT VALUE out.uuid FROM mentions WHERE in.uuid IN $uuids)
+            """,
+            uuids=episode_uuids,
+            routing_='r',
+        )
+        return [get_entity_node_from_record(record, driver.provider) for record in records]
+
     records, _, _ = await driver.execute_query(
         """
         MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity)
@@ -162,6 +182,18 @@ async def get_communities_by_nodes(
             pass
 
     node_uuids = [node.uuid for node in nodes]
+
+    if driver.provider == GraphProvider.SURREALDB:
+        records, _, _ = await driver.execute_query(
+            """
+            SELECT uuid, name, group_id, created_at, summary, name_embedding
+            FROM community
+            WHERE uuid IN (SELECT VALUE in.uuid FROM has_member WHERE out.uuid IN $uuids)
+            """,
+            uuids=node_uuids,
+            routing_='r',
+        )
+        return [get_community_node_from_record(record) for record in records]
 
     records, _, _ = await driver.execute_query(
         """
@@ -190,6 +222,42 @@ async def edge_fulltext_search(
         return await driver.search_interface.edge_fulltext_search(
             driver, query, search_filter, group_ids, limit
         )
+
+    if driver.provider == GraphProvider.SURREALDB:
+        fuzzy_query = fulltext_query(query, group_ids, driver)
+        if fuzzy_query == '':
+            return []
+
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, group_id,
+                in.uuid AS source_node_uuid,
+                out.uuid AS target_node_uuid,
+                created_at, name, fact, episodes,
+                expired_at, valid_at, invalid_at,
+                {{}} AS attributes,
+                search::score(0) + search::score(1) AS score
+            FROM relates_to
+            WHERE (name @@ $query OR fact @@ $query)
+            {extra_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_edge_from_record(record, driver.provider) for record in records]
 
     # fulltext search over facts
     fuzzy_query = fulltext_query(query, group_ids, driver)
@@ -315,6 +383,45 @@ async def edge_similarity_search(
             limit,
             min_score,
         )
+
+    if driver.provider == GraphProvider.SURREALDB:
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+            if source_node_uuid is not None:
+                filter_params['source_uuid'] = source_node_uuid
+                filter_queries.append('in.uuid = $source_uuid')
+            if target_node_uuid is not None:
+                filter_params['target_uuid'] = target_node_uuid
+                filter_queries.append('out.uuid = $target_uuid')
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, group_id,
+                in.uuid AS source_node_uuid,
+                out.uuid AS target_node_uuid,
+                created_at, name, fact, episodes,
+                expired_at, valid_at, invalid_at,
+                {{}} AS attributes,
+                vector::similarity::cosine(fact_embedding, $search_vector) AS score
+            FROM relates_to
+            WHERE vector::similarity::cosine(fact_embedding, $search_vector) > $min_score
+            {extra_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            search_vector=search_vector,
+            min_score=min_score,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_edge_from_record(record, driver.provider) for record in records]
 
     match_query = """
         MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
@@ -462,6 +569,74 @@ async def edge_bfs_search(
     if bfs_origin_node_uuids is None or len(bfs_origin_node_uuids) == 0:
         return []
 
+    if driver.provider == GraphProvider.SURREALDB:
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        # SurrealDB doesn't have variable-length path patterns like Cypher's *1..N.
+        # We first resolve episodic origins to mentioned entities, then expand via
+        # relates_to edges iteratively for the requested depth.
+        seed_query = """
+        LET $mentioned = (SELECT VALUE out.uuid FROM mentions WHERE in.uuid IN $origins);
+        SELECT VALUE array::distinct(array::concat($origins, $mentioned));
+        """
+        seed_result, _, _ = await driver.execute_query(
+            seed_query, origins=bfs_origin_node_uuids, routing_='r'
+        )
+        current_uuids = set(bfs_origin_node_uuids)
+        if seed_result and isinstance(seed_result, list):
+            for item in seed_result:
+                if isinstance(item, list):
+                    current_uuids.update(item)
+                elif isinstance(item, str):
+                    current_uuids.add(item)
+
+        # Iteratively expand the frontier for depth > 1
+        for _ in range(bfs_max_depth - 1):
+            neighbor_records, _, _ = await driver.execute_query(
+                """
+                SELECT VALUE array::distinct(array::concat(
+                    (SELECT VALUE out.uuid FROM relates_to WHERE in.uuid IN $node_uuids),
+                    (SELECT VALUE in.uuid FROM relates_to WHERE out.uuid IN $node_uuids)
+                ));
+                """,
+                node_uuids=list(current_uuids),
+                routing_='r',
+            )
+            if neighbor_records and isinstance(neighbor_records, list):
+                for item in neighbor_records:
+                    if isinstance(item, list):
+                        current_uuids.update(item)
+                    elif isinstance(item, str):
+                        current_uuids.add(item)
+
+        # Fetch all RELATES_TO edges incident on any reachable entity
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, group_id,
+                in.uuid AS source_node_uuid,
+                out.uuid AS target_node_uuid,
+                created_at, name, fact, episodes,
+                expired_at, valid_at, invalid_at,
+                {{}} AS attributes
+            FROM relates_to
+            WHERE (in.uuid IN $node_uuids OR out.uuid IN $node_uuids)
+            {extra_filter}
+            LIMIT $limit
+            """,
+            node_uuids=list(current_uuids),
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_edge_from_record(record, driver.provider) for record in records]
+
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
     )
@@ -585,6 +760,36 @@ async def node_fulltext_search(
             driver, query, search_filter, group_ids, limit
         )
 
+    if driver.provider == GraphProvider.SURREALDB:
+        fuzzy_query = fulltext_query(query, group_ids, driver)
+        if fuzzy_query == '':
+            return []
+        filter_queries, filter_params = node_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, name, group_id, labels, created_at, summary,
+                search::score(0) + search::score(1) AS score
+            FROM entity
+            WHERE (name @@ $query OR summary @@ $query)
+            {extra_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_node_from_record(record, driver.provider) for record in records]
+
     # BM25 search to get top nodes
     fuzzy_query = fulltext_query(query, group_ids, driver)
     if fuzzy_query == '':
@@ -678,6 +883,34 @@ async def node_similarity_search(
         return await driver.search_interface.node_similarity_search(
             driver, search_vector, search_filter, group_ids, limit, min_score
         )
+
+    if driver.provider == GraphProvider.SURREALDB:
+        filter_queries, filter_params = node_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, name, group_id, labels, created_at, summary,
+                vector::similarity::cosine(name_embedding, $search_vector) AS score
+            FROM entity
+            WHERE vector::similarity::cosine(name_embedding, $search_vector) > $min_score
+            {extra_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            search_vector=search_vector,
+            min_score=min_score,
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_node_from_record(record, driver.provider) for record in records]
 
     filter_queries, filter_params = node_search_filter_query_constructor(
         search_filter, driver.provider
@@ -803,6 +1036,64 @@ async def node_bfs_search(
     if bfs_origin_node_uuids is None or len(bfs_origin_node_uuids) == 0 or bfs_max_depth < 1:
         return []
 
+    if driver.provider == GraphProvider.SURREALDB:
+        filter_queries, filter_params = node_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        if group_ids is not None:
+            filter_queries.append('group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        # Resolve episodic origins to mentioned entities, then expand via relates_to
+        seed_query = """
+        LET $mentioned = (SELECT VALUE out.uuid FROM mentions WHERE in.uuid IN $origins);
+        SELECT VALUE array::distinct(array::concat($origins, $mentioned));
+        """
+        seed_result, _, _ = await driver.execute_query(
+            seed_query, origins=bfs_origin_node_uuids, routing_='r'
+        )
+        current_uuids = set(bfs_origin_node_uuids)
+        if seed_result and isinstance(seed_result, list):
+            for item in seed_result:
+                if isinstance(item, list):
+                    current_uuids.update(item)
+                elif isinstance(item, str):
+                    current_uuids.add(item)
+
+        for _ in range(bfs_max_depth - 1):
+            neighbor_records, _, _ = await driver.execute_query(
+                """
+                SELECT VALUE array::distinct(array::concat(
+                    (SELECT VALUE out.uuid FROM relates_to WHERE in.uuid IN $node_uuids),
+                    (SELECT VALUE in.uuid FROM relates_to WHERE out.uuid IN $node_uuids)
+                ));
+                """,
+                node_uuids=list(current_uuids),
+                routing_='r',
+            )
+            if neighbor_records and isinstance(neighbor_records, list):
+                for item in neighbor_records:
+                    if isinstance(item, list):
+                        current_uuids.update(item)
+                    elif isinstance(item, str):
+                        current_uuids.add(item)
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT uuid, name, group_id, labels, created_at, summary
+            FROM entity
+            WHERE uuid IN $node_uuids
+            {extra_filter}
+            LIMIT $limit
+            """,
+            node_uuids=list(current_uuids),
+            limit=limit,
+            routing_='r',
+            **filter_params,
+        )
+        return [get_entity_node_from_record(record, driver.provider) for record in records]
+
     filter_queries, filter_params = node_search_filter_query_constructor(
         search_filter, driver.provider
     )
@@ -892,6 +1183,35 @@ async def episode_fulltext_search(
             driver, query, _search_filter, group_ids, limit
         )
 
+    if driver.provider == GraphProvider.SURREALDB:
+        fuzzy_query = fulltext_query(query, group_ids, driver)
+        if fuzzy_query == '':
+            return []
+        filter_params_s: dict[str, Any] = {}
+        group_filter = ''
+        if group_ids is not None:
+            group_filter = 'AND group_id IN $group_ids'
+            filter_params_s['group_ids'] = group_ids
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                content, created_at, valid_at, uuid, name,
+                group_id, source_description, source, entity_edges,
+                search::score(0) AS score
+            FROM episodic
+            WHERE content @@ $query
+            {group_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+            **filter_params_s,
+        )
+        return [get_episodic_node_from_record(record) for record in records]
+
     # BM25 search to get top episodes
     fuzzy_query = fulltext_query(query, group_ids, driver)
     if fuzzy_query == '':
@@ -979,6 +1299,34 @@ async def community_fulltext_search(
             )
         except NotImplementedError:
             pass
+
+    if driver.provider == GraphProvider.SURREALDB:
+        fuzzy_query = fulltext_query(query, group_ids, driver)
+        if fuzzy_query == '':
+            return []
+        filter_params_s: dict[str, Any] = {}
+        group_filter = ''
+        if group_ids is not None:
+            group_filter = 'AND group_id IN $group_ids'
+            filter_params_s['group_ids'] = group_ids
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, name, group_id, created_at, summary, name_embedding,
+                search::score(0) AS score
+            FROM community
+            WHERE name @@ $query
+            {group_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            query=fuzzy_query,
+            limit=limit,
+            routing_='r',
+            **filter_params_s,
+        )
+        return [get_community_node_from_record(record) for record in records]
 
     # BM25 search to get top communities
     fuzzy_query = fulltext_query(query, group_ids, driver)
@@ -1069,6 +1417,32 @@ async def community_similarity_search(
             )
         except NotImplementedError:
             pass
+
+    if driver.provider == GraphProvider.SURREALDB:
+        query_params_s: dict[str, Any] = {}
+        group_filter = ''
+        if group_ids is not None:
+            group_filter = 'AND group_id IN $group_ids'
+            query_params_s['group_ids'] = group_ids
+
+        records, _, _ = await driver.execute_query(
+            f"""
+            SELECT
+                uuid, name, group_id, created_at, summary, name_embedding,
+                vector::similarity::cosine(name_embedding, $search_vector) AS score
+            FROM community
+            WHERE vector::similarity::cosine(name_embedding, $search_vector) > $min_score
+            {group_filter}
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            search_vector=search_vector,
+            min_score=min_score,
+            limit=limit,
+            routing_='r',
+            **query_params_s,
+        )
+        return [get_community_node_from_record(record) for record in records]
 
     # vector similarity search over entity names
     query_params: dict[str, Any] = {}
@@ -1257,6 +1631,67 @@ async def get_relevant_nodes(
     if len(nodes) == 0:
         return []
 
+    if driver.provider == GraphProvider.SURREALDB:
+        group_id = nodes[0].group_id
+        filter_queries, filter_params = node_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        async def _find_relevant_surreal(node: EntityNode) -> list[EntityNode]:
+            # Vector similarity search
+            vec_records, _, _ = await driver.execute_query(
+                f"""
+                SELECT uuid, name, group_id, labels, created_at, summary, name_embedding
+                FROM entity
+                WHERE group_id = $group_id
+                AND uuid != $exclude_uuid
+                AND vector::similarity::cosine(name_embedding, $search_vector) > $min_score
+                {extra_filter}
+                ORDER BY vector::similarity::cosine(name_embedding, $search_vector) DESC
+                LIMIT $limit
+                """,
+                group_id=group_id,
+                exclude_uuid=node.uuid,
+                search_vector=node.name_embedding,
+                min_score=min_score,
+                limit=limit,
+                routing_='r',
+                **filter_params,
+            )
+            # Fulltext search
+            ft_query = fulltext_query(node.name, [node.group_id], driver)
+            ft_records: list[dict] = []
+            if ft_query:
+                ft_records, _, _ = await driver.execute_query(
+                    f"""
+                    SELECT uuid, name, group_id, labels, created_at, summary, name_embedding,
+                        search::score(0) + search::score(1) AS score
+                    FROM entity
+                    WHERE (name @@ $query OR summary @@ $query)
+                    AND group_id = $group_id AND uuid != $exclude_uuid
+                    {extra_filter}
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """,
+                    query=ft_query,
+                    group_id=group_id,
+                    exclude_uuid=node.uuid,
+                    limit=limit,
+                    routing_='r',
+                    **filter_params,
+                )
+            seen: set[str] = set()
+            combined: list[EntityNode] = []
+            for r in list(vec_records) + list(ft_records):
+                if r['uuid'] not in seen:
+                    seen.add(r['uuid'])
+                    combined.append(get_entity_node_from_record(r, driver.provider))
+            return combined
+
+        results = list(await semaphore_gather(*[_find_relevant_surreal(node) for node in nodes]))
+        return results
+
     group_id = nodes[0].group_id
     query_nodes = [
         {
@@ -1410,6 +1845,48 @@ async def get_relevant_edges(
 ) -> list[list[EntityEdge]]:
     if len(edges) == 0:
         return []
+
+    if driver.provider == GraphProvider.SURREALDB:
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        async def _find_relevant_edges_surreal(edge: EntityEdge) -> list[EntityEdge]:
+            records, _, _ = await driver.execute_query(
+                f"""
+                SELECT
+                    uuid, group_id,
+                    in.uuid AS source_node_uuid,
+                    out.uuid AS target_node_uuid,
+                    created_at, name, fact, episodes,
+                    expired_at, valid_at, invalid_at,
+                    {{}} AS attributes, fact_embedding,
+                    vector::similarity::cosine(fact_embedding, $search_vector) AS score
+                FROM relates_to
+                WHERE (in.uuid IN [$source_uuid, $target_uuid]
+                    AND out.uuid IN [$source_uuid, $target_uuid])
+                AND group_id = $group_id
+                AND vector::similarity::cosine(fact_embedding, $search_vector) > $min_score
+                {extra_filter}
+                ORDER BY score DESC
+                LIMIT $limit
+                """,
+                source_uuid=edge.source_node_uuid,
+                target_uuid=edge.target_node_uuid,
+                group_id=edge.group_id,
+                search_vector=edge.fact_embedding,
+                min_score=min_score,
+                limit=limit,
+                routing_='r',
+                **filter_params,
+            )
+            return [get_entity_edge_from_record(r, driver.provider) for r in records]
+
+        results = list(
+            await semaphore_gather(*[_find_relevant_edges_surreal(edge) for edge in edges])
+        )
+        return results
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
@@ -1595,6 +2072,48 @@ async def get_edge_invalidation_candidates(
 ) -> list[list[EntityEdge]]:
     if len(edges) == 0:
         return []
+
+    if driver.provider == GraphProvider.SURREALDB:
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider
+        )
+        extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+        async def _find_invalidation_surreal(edge: EntityEdge) -> list[EntityEdge]:
+            records, _, _ = await driver.execute_query(
+                f"""
+                SELECT
+                    uuid, group_id,
+                    in.uuid AS source_node_uuid,
+                    out.uuid AS target_node_uuid,
+                    created_at, name, fact, episodes,
+                    expired_at, valid_at, invalid_at,
+                    {{}} AS attributes, fact_embedding,
+                    vector::similarity::cosine(fact_embedding, $search_vector) AS score
+                FROM relates_to
+                WHERE (in.uuid IN [$source_uuid, $target_uuid]
+                    OR out.uuid IN [$source_uuid, $target_uuid])
+                AND group_id = $group_id
+                AND vector::similarity::cosine(fact_embedding, $search_vector) > $min_score
+                {extra_filter}
+                ORDER BY score DESC
+                LIMIT $limit
+                """,
+                source_uuid=edge.source_node_uuid,
+                target_uuid=edge.target_node_uuid,
+                group_id=edge.group_id,
+                search_vector=edge.fact_embedding,
+                min_score=min_score,
+                limit=limit,
+                routing_='r',
+                **filter_params,
+            )
+            return [get_entity_edge_from_record(r, driver.provider) for r in records]
+
+        results = list(
+            await semaphore_gather(*[_find_invalidation_surreal(edge) for edge in edges])
+        )
+        return results
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
@@ -1810,15 +2329,26 @@ async def node_distance_reranker(
     filtered_uuids = list(filter(lambda node_uuid: node_uuid != center_node_uuid, node_uuids))
     scores: dict[str, float] = {center_node_uuid: 0.0}
 
-    query = """
-    UNWIND $node_uuids AS node_uuid
-    MATCH (center:Entity {uuid: $center_uuid})-[:RELATES_TO]-(n:Entity {uuid: node_uuid})
-    RETURN 1 AS score, node_uuid AS uuid
-    """
-    if driver.provider == GraphProvider.KUZU:
+    if driver.provider == GraphProvider.SURREALDB:
+        query = """
+        SELECT 1 AS score, out.uuid AS uuid
+        FROM relates_to
+        WHERE in.uuid = $center_uuid AND out.uuid IN $node_uuids
+        UNION
+        SELECT 1 AS score, in.uuid AS uuid
+        FROM relates_to
+        WHERE out.uuid = $center_uuid AND in.uuid IN $node_uuids
+        """
+    elif driver.provider == GraphProvider.KUZU:
         query = """
         UNWIND $node_uuids AS node_uuid
         MATCH (center:Entity {uuid: $center_uuid})-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(n:Entity {uuid: node_uuid})
+        RETURN 1 AS score, node_uuid AS uuid
+        """
+    else:
+        query = """
+        UNWIND $node_uuids AS node_uuid
+        MATCH (center:Entity {uuid: $center_uuid})-[:RELATES_TO]-(n:Entity {uuid: node_uuid})
         RETURN 1 AS score, node_uuid AS uuid
         """
 
@@ -1869,13 +2399,23 @@ async def episode_mentions_reranker(
     sorted_uuids, _ = rrf(node_uuids)
     scores: dict[str, float] = {}
 
-    # Find the shortest path to center node
-    results, _, _ = await driver.execute_query(
+    if driver.provider == GraphProvider.SURREALDB:
+        query = """
+        SELECT count() AS score, out.uuid AS uuid
+        FROM mentions
+        WHERE out.uuid IN $node_uuids
+        GROUP BY out.uuid
         """
+    else:
+        query = """
         UNWIND $node_uuids AS node_uuid
         MATCH (episode:Episodic)-[r:MENTIONS]->(n:Entity {uuid: node_uuid})
         RETURN count(*) AS score, n.uuid AS uuid
-        """,
+        """
+
+    # Find the shortest path to center node
+    results, _, _ = await driver.execute_query(
+        query,
         node_uuids=sorted_uuids,
         routing_='r',
     )
@@ -1941,6 +2481,12 @@ async def get_embeddings_for_nodes(
 ) -> dict[str, list[float]]:
     if driver.graph_operations_interface:
         return await driver.graph_operations_interface.node_load_embeddings_bulk(driver, nodes)
+    elif driver.provider == GraphProvider.SURREALDB:
+        query = """
+        SELECT uuid, name_embedding
+        FROM entity
+        WHERE uuid IN $node_uuids
+        """
     elif driver.provider == GraphProvider.NEPTUNE:
         query = """
         MATCH (n:Entity)
@@ -1982,7 +2528,13 @@ async def get_embeddings_for_communities(
         except NotImplementedError:
             pass
 
-    if driver.provider == GraphProvider.NEPTUNE:
+    if driver.provider == GraphProvider.SURREALDB:
+        query = """
+        SELECT uuid, name_embedding
+        FROM community
+        WHERE uuid IN $community_uuids
+        """
+    elif driver.provider == GraphProvider.NEPTUNE:
         query = """
         MATCH (c:Community)
         WHERE c.uuid IN $community_uuids
@@ -2019,6 +2571,12 @@ async def get_embeddings_for_edges(
 ) -> dict[str, list[float]]:
     if driver.graph_operations_interface:
         return await driver.graph_operations_interface.edge_load_embeddings_bulk(driver, edges)
+    elif driver.provider == GraphProvider.SURREALDB:
+        query = """
+        SELECT uuid, fact_embedding
+        FROM relates_to
+        WHERE uuid IN $edge_uuids
+        """
     elif driver.provider == GraphProvider.NEPTUNE:
         query = """
         MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity)

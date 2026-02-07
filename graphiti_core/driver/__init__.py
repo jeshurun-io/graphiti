@@ -16,4 +16,6 @@ limitations under the License.
 
 from neo4j import Neo4jDriver
 
-__all__ = ['Neo4jDriver']
+from graphiti_core.driver.surrealdb_driver import SurrealDBDriver
+
+__all__ = ['Neo4jDriver', 'SurrealDBDriver']

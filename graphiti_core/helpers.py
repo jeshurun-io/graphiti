@@ -74,6 +74,11 @@ def get_default_group_id(provider: GraphProvider) -> str:
         return ''
 
 
+def surrealdb_sanitize(query: str) -> str:
+    """Sanitize a search query for SurrealDB fulltext search."""
+    return re.sub(r'[^\w\s]', ' ', query).strip()
+
+
 def lucene_sanitize(query: str) -> str:
     # Escape special characters from a query before passing into Lucene
     # + - && || ! ( ) { } [ ] ^ " ~ * ? : \ /

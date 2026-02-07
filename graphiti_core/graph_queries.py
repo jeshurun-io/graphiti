@@ -26,6 +26,10 @@ INDEX_TO_LABEL_KUZU_MAPPING = {
 
 
 def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
+    if provider == GraphProvider.SURREALDB:
+        # SurrealDB indexes are created in surrealdb_driver.py as part of schema setup
+        return []
+
     if provider == GraphProvider.FALKORDB:
         return [
             # Entity node
@@ -83,6 +87,10 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
 
 
 def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
+    if provider == GraphProvider.SURREALDB:
+        # SurrealDB fulltext indexes are created in surrealdb_driver.py
+        return []
+
     if provider == GraphProvider.FALKORDB:
         from typing import cast
 
@@ -141,6 +149,11 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
 
 
 def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) -> str:
+    if provider == GraphProvider.SURREALDB:
+        # SurrealDB fulltext queries use @@ operator directly in WHERE clauses
+        # This is handled inline in search_utils.py instead
+        return ''
+
     if provider == GraphProvider.FALKORDB:
         label = NEO4J_TO_FALKORDB_MAPPING[name]
         return f"CALL db.idx.fulltext.queryNodes('{label}', {query})"
@@ -153,6 +166,9 @@ def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) 
 
 
 def get_vector_cosine_func_query(vec1, vec2, provider: GraphProvider) -> str:
+    if provider == GraphProvider.SURREALDB:
+        return f'vector::similarity::cosine({vec1}, {vec2})'
+
     if provider == GraphProvider.FALKORDB:
         # FalkorDB uses a different syntax for regular cosine similarity and Neo4j uses normalized cosine similarity
         return f'(2 - vec.cosineDistance({vec1}, vecf32({vec2})))/2'
@@ -164,6 +180,11 @@ def get_vector_cosine_func_query(vec1, vec2, provider: GraphProvider) -> str:
 
 
 def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> str:
+    if provider == GraphProvider.SURREALDB:
+        # SurrealDB fulltext queries use @@ operator directly in WHERE clauses
+        # This is handled inline in search_utils.py instead
+        return ''
+
     if provider == GraphProvider.FALKORDB:
         label = NEO4J_TO_FALKORDB_MAPPING[name]
         return f"CALL db.idx.fulltext.queryRelationships('{label}', $query)"

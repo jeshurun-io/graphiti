@@ -28,6 +28,14 @@ EPISODIC_EDGE_SAVE = """
 
 
 def get_episodic_edge_save_bulk_query(provider: GraphProvider) -> str:
+    if provider == GraphProvider.SURREALDB:
+        return """
+            INSERT RELATION INTO mentions $episodic_edges ON DUPLICATE KEY UPDATE
+                group_id = $input.group_id,
+                created_at = $input.created_at
+            RETURN uuid;
+        """
+
     if provider == GraphProvider.KUZU:
         return """
             MATCH (episode:Episodic {uuid: $source_node_uuid})
@@ -62,6 +70,33 @@ EPISODIC_EDGE_RETURN = """
 
 def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                INSERT RELATION INTO relates_to {
+                    id: type::thing('relates_to', $edge_data.uuid),
+                    in: type::thing('entity', $edge_data.source_uuid),
+                    out: type::thing('entity', $edge_data.target_uuid),
+                    uuid: $edge_data.uuid,
+                    group_id: $edge_data.group_id,
+                    name: $edge_data.name,
+                    fact: $edge_data.fact,
+                    episodes: $edge_data.episodes,
+                    created_at: $edge_data.created_at,
+                    expired_at: $edge_data.expired_at,
+                    valid_at: $edge_data.valid_at,
+                    invalid_at: $edge_data.invalid_at,
+                    fact_embedding: $edge_data.fact_embedding
+                } ON DUPLICATE KEY UPDATE
+                    name = $input.name,
+                    fact = $input.fact,
+                    group_id = $input.group_id,
+                    episodes = $input.episodes,
+                    expired_at = $input.expired_at,
+                    valid_at = $input.valid_at,
+                    invalid_at = $input.invalid_at,
+                    fact_embedding = $input.fact_embedding
+                RETURN uuid;
+            """
         case GraphProvider.FALKORDB:
             return """
                 MATCH (source:Entity {uuid: $edge_data.source_uuid})
@@ -123,6 +158,19 @@ def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) 
 
 def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = False) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                INSERT RELATION INTO relates_to $entity_edges ON DUPLICATE KEY UPDATE
+                    name = $input.name,
+                    fact = $input.fact,
+                    group_id = $input.group_id,
+                    episodes = $input.episodes,
+                    expired_at = $input.expired_at,
+                    valid_at = $input.valid_at,
+                    invalid_at = $input.invalid_at,
+                    fact_embedding = $input.fact_embedding
+                RETURN uuid;
+            """
         case GraphProvider.FALKORDB:
             return """
                 UNWIND $entity_edges AS edge
@@ -187,6 +235,21 @@ def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = Fa
 def get_entity_edge_return_query(provider: GraphProvider) -> str:
     # `fact_embedding` is not returned by default and must be manually loaded using `load_fact_embedding()`.
 
+    if provider == GraphProvider.SURREALDB:
+        return """
+        uuid,
+        in.uuid AS source_node_uuid,
+        out.uuid AS target_node_uuid,
+        group_id,
+        created_at,
+        name,
+        fact,
+        episodes,
+        expired_at,
+        valid_at,
+        invalid_at
+    """
+
     if provider == GraphProvider.NEPTUNE:
         return """
         e.uuid AS uuid,
@@ -224,6 +287,20 @@ def get_entity_edge_return_query(provider: GraphProvider) -> str:
 
 def get_community_edge_save_query(provider: GraphProvider) -> str:
     match provider:
+        case GraphProvider.SURREALDB:
+            return """
+                INSERT RELATION INTO has_member {
+                    id: type::thing('has_member', $uuid),
+                    in: type::thing('community', $community_uuid),
+                    out: type::thing('entity', $entity_uuid),
+                    uuid: $uuid,
+                    group_id: $group_id,
+                    created_at: $created_at
+                } ON DUPLICATE KEY UPDATE
+                    group_id = $input.group_id,
+                    created_at = $input.created_at
+                RETURN uuid;
+            """
         case GraphProvider.FALKORDB:
             return """
                 MATCH (community:Community {uuid: $community_uuid})

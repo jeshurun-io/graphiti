@@ -44,6 +44,7 @@ class GraphProvider(Enum):
     FALKORDB = 'falkordb'
     KUZU = 'kuzu'
     NEPTUNE = 'neptune'
+    SURREALDB = 'surrealdb'
 
 
 class GraphDriverSession(ABC):

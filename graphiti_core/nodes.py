@@ -105,6 +105,15 @@ class Node(BaseModel, ABC):
                 pass
 
         match driver.provider:
+            case GraphProvider.SURREALDB:
+                for table in ['entity', 'episodic', 'community']:
+                    await driver.execute_query(
+                        f"""
+                        DELETE FROM {table} WHERE uuid = $uuid;
+                        """,
+                        uuid=self.uuid,
+                    )
+
             case GraphProvider.NEO4J:
                 records, _, _ = await driver.execute_query(
                     """
@@ -1010,7 +1019,11 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
 
 
 def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityNode:
-    if provider == GraphProvider.KUZU:
+    if provider == GraphProvider.SURREALDB:
+        # SurrealDB returns attributes as part of the record directly
+        # but we query only specific fields, so attributes dict is empty by default
+        attributes = {}
+    elif provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
     else:
         attributes = record['attributes']
